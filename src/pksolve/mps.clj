@@ -1,28 +1,25 @@
 (ns pksolve.mps
-  (:require [spork.util.records]))
+  (:require [spork.util.record]
+            [clojure.pprint :as pprint :refer [cl-format]]
+            [clojure.spec.alpha :as s]))
 
 ;; see http://web.mit.edu/lpsolve/doc/mps-format.htm
-(require "split-sequence")
-(require "alexandria")
-
-(defrecord row-data [name type rhs range lb ub])
+;(require "split-sequence")
+;(require "alexandria")
 
 #_(defstruct row-data
-  name type rhs range lb ub)
-
-(defrecord col-data [name lb ub])
-
+    name type rhs range lb ub)
 #_(defstruct col-data
-  ;; default: [0, infty)
-  name lb ub)
-
+    ;; default: [0, infty)
+    name lb ub)
 #_(defstruct triplet
-  col row value)
+    col row value)
 
-(defrecord triplet [col row value])
-                                    
+(defrecord row-data [name type rhs range lb ub])
+(defrecord col-data [name lb ub])
+(defrecord triplet  [col row value])
 
-(defstruct mps-data
+#_(defstruct mps-data
   name
   ;; default: min
   (sense nil :type (member nil min max))
@@ -40,38 +37,128 @@
   (col-data (make-array 16 :adjustable t :fill-pointer 0)
    :read-only t)
   (triplets (make-array 16 :adjustable t :fill-pointer 0)
-   :read-only t))
+            :read-only t))
 
-(defvar *mps-stream*)
+(defrecord mps-data
+    [name
+     sense
+     rows
+     row-data
+     obj-row
+     columns
+     col-data
+     triplets])
 
-(defun tokenize-line (line)
+#_(defvar *mps-stream*)
+(def ^:dynamic *mps-stream*)
+
+#_(defun tokenize-line (line)
   (values (split-sequence:split-sequence #\Space line
                                          :remove-empty-subseqs t)
           (and (plusp (length line))
                (char/= #\Space (aref line 0)))))
 
-(defun get-line ()
+(defn tokenize-line [line]
+  [(filter (complement empty?) (clojure.string/split line #"\s"))
+   (and (pos? (count line))
+        (= \space (nth line 0)))])
+
+#_(defun get-line ()
   (let ((line (read-line *mps-stream* nil nil)))
     (if line
         (tokenize-line line)
         (values nil t))))
 
-(defun get-section-line ()
+;;redo this stream-based global mutation stuff.
+(defn get-line! []
+  (let [line (read-line *mps-stream*)]
+    (if line
+      (tokenize-line)
+      [nil true])))
+
+#_(defun get-section-line ()
   (multiple-value-bind (tokens sectionp)
       (get-line)
     (assert sectionp)
     (values tokens sectionp)))
 
-(defvar *mps-data*)
+;;redo this stream-based global mutation stuff
+(defn get-section-line [line]
+  (let [[tokens section?] line]
+    (assert section?)
+    [tokens section?]))
 
-(defun read-name (line)
+(s/def ::heading  (s/and (complement second)
+                         (s/conformer (fn [[xs _]]
+                                        (let [res {:type (first xs)}]
+                                          (if-let [v (second xs)]
+                                            (assoc res :property v)
+                                            res))))))
+
+(defn leads-with [k]
+  (fn [{:keys [type body]}]
+    (= (clojure.string/lower-case type) k)))
+
+(s/def ::section  (s/and second
+                         (s/conformer first)))
+
+(defn heading-with [nm]
+  (s/and ::heading
+         (leads-with nm)))
+
+(s/def ::direction
+  #{"MIN" "MAX" "MINIMIZE" "MAXIMIZE" "min" "minimize" "max" "maximize"})
+
+(s/def ::sense
+  (s/and  (s/cat :sense     (heading-with  "objsense")
+                 :direction (s/and (s/conformer ffirst)
+                                   ::direction))
+          (s/conformer (fn [{:keys [sense direction]}]
+                         (assoc sense :direction direction)))))
+
+(defn section-by [k]
+  (s/cat :section (heading-with k)
+         :body (s/* ::section)))
+
+(s/def ::name    (heading-with  "name"))
+(s/def ::sense   (s/and (section-by    "objsense")
+                        (s/conformer (fn [{:keys []}])))
+(s/def ::rows    (section-by    "rows"))
+(s/def ::columns (section-by    "columns"))
+(s/def ::rhs     (section-by    "rhs"))
+(s/def ::bounds  (section-by    "bounds"))
+(s/def ::end     (section-by    "endata"))
+
+(s/def ::mps (s/cat :name    ::name
+                    :sense   ::sense
+                    :rows    ::rows
+                    :columns ::columns
+                    :rhs     ::rhs
+                    :bounds  ::bounds
+                    :end     ::end
+                    ))
+
+;;we'll break this up into mps->lines
+
+;gobal mutable
+;(defvar *mps-data*)
+(def ^:dynamic *mps-data*)
+
+#_(defun read-name (line)
   (assert (equalp "name" (first line)))
   (assert (>= (length line) 2))
   (assert (not (mps-data-name *mps-data*)))
   (setf (mps-data-name *mps-data*) (format nil "~{~A~^ ~}" (rest line)))
   (get-section-line))
 
-(defun read-sense (line)
+;;we change this to a more functional style.
+(defn read-name [mps-data line]
+  (assert (= "name" (first line)))
+  (assert (>= (length line) 2))
+  (assert (not (:name mps-data )))
+  (assoc mps-data :name  (cl-format nil "~{~A~^ ~}" (rest line))))
+
+#_(defun read-sense (line)
   (assert (equalp "objsense" (first line)))
   (assert (not (mps-data-sense *mps-data*)))
   (multiple-value-bind (tokens sectionp)
@@ -84,7 +171,49 @@
             ("maximize" 'max)
             ("min" 'min)
             ("minimize" 'min))))
-  (get-section-line))
+    (get-section-line))
+
+(s/def ::max #{"max" "maximize"})
+(s/def ::min #{"min" "minimize"})
+(s/def ::sense (s/or :max ::max
+                     :min ::min))
+
+(defn line->name [l]
+  (tokenize-line l))
+
+(s/def ::section
+  (s/and non-comment?
+         (s/conformer (fn [ln]
+                        (let [body (non-comment ln)]
+                          [:code 
+                           {:open   (count (re-seq #"\("  body))
+                            :closed (count (re-seq #"\)"  body))
+                            :line ln}])))))
+(s/def ::non-code
+  (s/or :blank ::blank-line
+        :comment ::commented-text))
+
+(s/def ::source-block
+  (s/or :code-line    ::code
+        :non-code ::non-code))
+
+(s/def ::source-code (s/* ::source-block))
+
+(s/def ::mps
+  )
+
+;;reading the objective sense is really
+(defn read-sense [mps-data lines]
+  (assert (= "objsense" (first line)))
+  (assert (not (:sense mps-data)))
+  (let [[tokens section?] (get-line!)]
+    (assert (not section?))
+    (assert (= 1 (count tokens)))
+    (assoc mps-data :sense
+           (case (first tokens)
+             ("max" "maximize") 'max
+             ("min" "minimize") 'min
+             (throw (ex-info "unknown sense" {:line line :sense (first tokens)}))))))
 
 (defun read-rows (line)
   (assert (equalp line '("rows")))
